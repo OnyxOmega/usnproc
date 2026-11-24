@@ -21,8 +21,10 @@
    to the `NextUsn` captured at start.
 4. Turn each record into a usnmon-contract event (IDs 100–105, provider
    `USNJournalMonitor`, same EventData layout).
-5. Write a standalone `{MachineGuid}[_{CaseID}].evtx`.
-6. Write a `{MachineGuid}[_{CaseID}].manifest.json` chain-of-custody manifest
+5. Write a standalone `{MachineGuid}[_{CaseID}]_{ProcessedUtc}.evtx`
+   (see D6).
+6. Write a `{MachineGuid}[_{CaseID}]_{ProcessedUtc}.manifest.json`
+   chain-of-custody manifest
    (schema 1.0).
 7. Exit with one of the 11 locked codes (0–10).
 
@@ -61,6 +63,19 @@ contract-parity unit test (section 6) catches any drift.
 ---
 
 ## 3. Decisions needed (gaps the lock doesn't cover)
+
+### Decision record (2026-11-24)
+
+| # | Decision | Status |
+|---|---|---|
+| D1 | **Native EVTX writer**, option (a). No ReportEvent, no temporary channel. | Decided |
+| D2 | Proposed: `TimeCreated` and `UtcTime` = the USN record timestamp. The conversion time goes only in the manifest and file name. | **Waiting for confirmation** |
+| D3 | **Rebuild paths where possible** (OpenFileById, then the parent map built from journal records, then `?` for parts that can't be resolved). | Decided |
+| D4 | As recommended: tell disabled and missing apart by whether `$UsnJrnl` exists. Raw `$J` read is a stretch goal, pending the verify results. | Decided |
+| D5 | As recommended: hash the image file as given, label it a file hash, and add the E01 caveat to the mismatch message. | Decided |
+| D6 | **Never overwrite.** Add the processing time to the file names so repeat runs make new files: `{MachineGuid}[_{CaseID}]_{YYYYMMDDTHHMMSSZ}.evtx` and the matching `.manifest.json`. The timestamp is `processing_timestamp_utc` in compact form, the same value in both names. If a file still exists (two runs in the same second) → exit 8. **This changes the Q1 file name in DESIGN_LOCK.md.** | Decided |
+
+The original analysis of each option follows.
 
 **D1 — How the `.evtx` is written. This is the biggest one.**
 usnmon writes with `ReportEvent` into the live `FileSystem` channel. For
@@ -251,7 +266,7 @@ answers on D1–D6.
 - `VERSION = "0.0.1"`; constants for the `EXIT_*` codes (0–10)
 - `parse_args(argv)` — argparse per Q2, with `--verbose`/`--quiet` mutually exclusive; raises `UsageError` → exit 10
 - `normalize_drive(arg)` — `F`, `F:`, `F:\` → `"F:\"`; rejects anything else
-- `output_names(machine_guid, case_id)` — returns the `.evtx` and `.manifest.json` file names
+- `output_names(machine_guid, case_id, processed_utc)` — returns `{guid}[_{case}]_{YYYYMMDDTHHMMSSZ}.evtx` and `.manifest.json` (D6)
 - `check_admin()` — elevated token check → exit 9
 - `check_ntfs(drive)` — `GetVolumeInformation`, file system must be `NTFS` → exit 7
 - `check_output_dir(path, names)` — exists, writable, nothing to overwrite → exit 8
