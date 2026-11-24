@@ -1,7 +1,7 @@
 # usnproc v0.0.1 — Design Lock
 
-**Document version:** 1.0
-**Date:** 2026-11-24
+**Document version:** 1.1
+**Date:** 2026-11-24 (v1.1 amendment same day; see Change log)
 **Status:** Design locked — ready for implementation
 **Target:** usnproc v0.0.1
 **Maintainer:** YASDC, Inc.
@@ -42,9 +42,14 @@ identifier.
 - VSN and image hash captured separately in the manifest for full provenance
 
 **Filename pattern:**
-- With `--case`: `{MachineGuid}_{CaseID}.evtx`
-- Without `--case`: `{MachineGuid}.evtx`
-- Manifest mirrors: `{MachineGuid}[_{CaseID}].manifest.json`
+- With `--case`: `{MachineGuid}_{CaseID}_{ProcessedUtc}.evtx`
+- Without `--case`: `{MachineGuid}_{ProcessedUtc}.evtx`
+- Manifest mirrors: `{MachineGuid}[_{CaseID}]_{ProcessedUtc}.manifest.json`
+- `{ProcessedUtc}` = the run's processing time in compact UTC form,
+  `YYYYMMDDTHHMMSSZ` (e.g. `20261124T192400Z`). It is the same value as the
+  manifest's `processing_timestamp_utc`, and both files get the same one.
+- **Never overwrite.** Each run makes new files. If a target file already
+  exists (two runs in the same second), abort with exit 8.
 
 ### Q2 — Command-line surface
 
@@ -242,7 +247,7 @@ JSON sidecar — one file per usnproc run. Documents provenance of the derived
   },
 
   "output": {
-    "evtx_filename": "a1b2c3d4-..._2026-0712-Ev003.evtx",
+    "evtx_filename": "a1b2c3d4-..._2026-0712-Ev003_20261124T192400Z.evtx",
     "evtx_hash_sha256": "...",
     "evtx_size_bytes": 785432109
   },
@@ -282,6 +287,28 @@ JSON sidecar — one file per usnproc run. Documents provenance of the derived
   represent the source system
 - Manifest carries the "how it was processed" story
 - Maximum portability of the `.evtx`
+
+### Q11 — Event timestamps: journal data only
+
+**Every event record is populated ONLY from the USN journal record and the
+source image.** No processing, capture or "current" time appears anywhere in
+any event.
+
+- `TimeCreated` (event record header) = the USN record's own `Timestamp`
+- `UtcTime` (EventData field) = the same USN record `Timestamp`, in usnmon's
+  `YYYY-MM-DD HH:MM:SS.mmmZ` format
+- `Qpc` / `HiResUtc` = `""` (see Implementation notes)
+- The processing time appears ONLY in reporting outputs: the file names
+  (Q1) and the manifest (`processing_timestamp_utc`, error/warning entries)
+- Why: a processing time inside an event would put every event in a
+  timeline at the same moment, on the wrong day
+- No `ProcessedUtc` or similar field is added to the event schema
+- Note for analysts: the USN `Timestamp` is when NTFS logged the change in
+  the journal. It is not the file's `$STANDARD_INFORMATION` times.
+
+This is why usnproc uses a native EVTX writer instead of `ReportEvent`:
+`ReportEvent` would stamp `TimeCreated` with the processing time and
+`Computer` with the analysis VM's name.
 
 ## Implementation notes
 
@@ -360,8 +387,8 @@ Once implementation is complete, the analyst workflow will be:
 3. One-time: run `usnproc_verify.py F` to confirm mount compatibility
 4. Run `usnproc.py F --case 2026-0712-Ev003`
 5. usnproc extracts source machine identity, walks the USN journal, produces:
-   - `{MachineGuid}_{CaseID}.evtx` — ready for EvtxECmd / Timeline Explorer
-   - `{MachineGuid}_{CaseID}.manifest.json` — chain of custody
+   - `{MachineGuid}_{CaseID}_{ProcessedUtc}.evtx` — ready for EvtxECmd / Timeline Explorer
+   - `{MachineGuid}_{CaseID}_{ProcessedUtc}.manifest.json` — chain of custody
 6. Analyst runs their existing analyzer tools against the `.evtx`
 
 ## Design freeze
@@ -373,3 +400,12 @@ re-litigation without a specific technical reason to revisit.
 ---
 
 **End of DESIGN_LOCK v1.0**
+
+## Change log
+
+- **v1.1 (2026-11-24):** Q1 file names now include the processing time
+  (`_{ProcessedUtc}`, compact UTC `YYYYMMDDTHHMMSSZ`) so repeat runs never
+  overwrite. Added Q11: event records contain only USN journal and
+  source-image data; processing time appears only in file names and the
+  manifest. The native EVTX writer is required to meet Q10/Q11.
+- **v1.0 (2026-11-24):** Initial design lock.
