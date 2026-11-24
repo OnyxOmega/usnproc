@@ -36,8 +36,48 @@ custom parser required.
 
 ## Status
 
-**Design phase.** The design is locked (see [DESIGN_LOCK.md](DESIGN_LOCK.md)).
-Verification script delivered. Main implementation forthcoming.
+**v0.0.1 implemented, pending field testing on Windows.** The design is
+locked (see [DESIGN_LOCK.md](DESIGN_LOCK.md) v1.1), and the build follows
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md). The test suite runs on any
+OS with simulated volumes and hives. It still has to be run against a real
+image mounted with FTK Imager.
+
+## Usage
+
+Run from an **elevated** prompt on a Windows 10+ analysis VM:
+
+```
+pip install -r requirements.txt
+python usnproc_verify.py F                                  # one-time mount check
+python usnproc.py F --case 2026-0712-Ev003 --image-path E:\cases\img.dd --output E:\out
+```
+
+Outputs, never overwritten:
+
+- `{MachineGuid}[_{CaseID}]_{YYYYMMDDTHHMMSSZ}.evtx` holds one event per USN
+  record (IDs 100–105, provider `USNJournalMonitor`, usnmon's EventData
+  layout). Use usnmon's EvtxECmd `maps/` to read it.
+- `{MachineGuid}[_{CaseID}]_{YYYYMMDDTHHMMSSZ}.manifest.json` is the
+  chain-of-custody manifest.
+
+Events contain **only USN journal and source-image data**. `TimeCreated` and
+`UtcTime` are the USN record's own timestamp, and `Computer` is the source
+machine's hostname. The processing time appears only in the file names and
+the manifest.
+
+Options: `--case`, `--case-notes`, `--output`, `--image-path`,
+`--image-hash`, `--skip-image-hash`, `--no-image-path`,
+`--continue-on-error`, `--verbose` or `--quiet`, `--version`. The exit codes
+(0–10) are listed in `usnproc.py` and DESIGN_LOCK Q5.
+
+## Development
+
+```
+python -m unittest discover -s tests     # usnproc tests (any OS)
+python test_usnproc_verify.py            # verify-script tests
+```
+
+`pip install python-evtx` turns on the tests that read the `.evtx` back.
 
 ## Related
 

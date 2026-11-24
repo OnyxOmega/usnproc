@@ -1,6 +1,7 @@
 # usnproc v0.0.1 — Implementation Plan
 
-> Status: draft for review · Date: 2026-11-24
+> Status: implemented (v0.0.1 build, 2026-11-24). Pending Windows field test.
+> Date: 2026-11-24
 > Inputs: `DESIGN_LOCK.md` v1.0 (this repo) and usnmon at
 > `OnyxOmega/USNJournal2EventLog` commit `bd09f19` (`usnmon.py`, `usn_common.py`,
 > `EVENT_ID.md`, `maps/`).
