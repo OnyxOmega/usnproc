@@ -1,0 +1,375 @@
+# usnproc v0.0.1 — Design Lock
+
+**Document version:** 1.0
+**Date:** 2026-11-24
+**Status:** Design locked — ready for implementation
+**Target:** usnproc v0.0.1
+**Maintainer:** YASDC, Inc.
+
+---
+
+## Purpose
+
+Offline processing of a mounted NTFS forensic image → standalone `.evtx` file
+compatible with the usnmon event schema + JSON sidecar manifest documenting
+provenance.
+
+**Not a live recorder. Not an analyzer chain-runner. Single job: produce a
+portable, tool-compatible `.evtx` + manifest from an offline image.**
+
+## Relationship to usnmon suite
+
+- **usnmon** — live USN journal recorder (Windows service)
+- **logmon** — Windows Event Log archive manager (rotation, retention)
+- **usnproc** — *this project* — offline processor for already-acquired images
+
+usnproc reuses usnmon's event contract (field order, EventData schema, event
+IDs 100-106) so the same EvtxECmd maps and downstream analyzers work on
+usnproc-produced archives without modification.
+
+## Design decisions (locked)
+
+### Q1 — Source machine identification
+
+**MachineGuid from the mounted image's SOFTWARE hive** is the primary machine
+identifier.
+
+- Registry path: `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`
+- Read from the offline hive file at
+  `<drive>:\Windows\System32\config\SOFTWARE` on the mounted image
+- Never from the analysis VM's live registry
+- Used in output filename and in every emitted event's `MachineGuid` field
+- VSN and image hash captured separately in the manifest for full provenance
+
+**Filename pattern:**
+- With `--case`: `{MachineGuid}_{CaseID}.evtx`
+- Without `--case`: `{MachineGuid}.evtx`
+- Manifest mirrors: `{MachineGuid}[_{CaseID}].manifest.json`
+
+### Q2 — Command-line surface
+
+```
+usnproc.py <drive-letter> [--case <case-id>]
+                          [--case-notes <string>]
+                          [--output <dir>]
+                          [--image-path <path>]
+                          [--image-hash <sha256>]
+                          [--skip-image-hash]
+                          [--no-image-path]
+                          [--continue-on-error]
+                          [--verbose | --quiet]
+                          [--help] [--version]
+```
+
+**Behaviors:**
+- Drive letter accepts `F`, `F:`, or `F:\` — normalized to `F:\` internally
+  **and in all outputs** (for no ambiguity)
+- `--case` is **optional**. Missing → no identifier, no note, ignored in
+  filename/manifest. Supports both case-tracked and quick-triage workflows.
+- `--case-notes` optional free-form string, embedded verbatim in manifest
+- `--output` defaults to current working directory
+- `--continue-on-error` silently records errors and moves on
+- Default mode (no `--continue-on-error`): interactive prompt on first error
+  (`y/N`), subsequent errors (`y`es / `i`gnore future / `n`o).
+  "Ignore future" = continue-on-error behavior for the rest of the run.
+- `--quiet` = reduced output volume; does NOT disable prompts
+- `--verbose` and `--quiet` mutually exclusive
+- `--help` and `--version` standard
+
+**Explicitly NOT included:**
+- No `--dry-run` (if validation succeeds, just do the work)
+- No MachineGuid override (identity comes from the image, period)
+- No `--no-manifest` (manifest is a first-class output)
+
+### Q3 — Platform
+
+**Windows 10+ only.** Same runtime environment as usnmon:
+- Windows 10 or later
+- Python 3
+- pywin32
+- python-registry
+
+No cross-platform scope in v0.0.1.
+
+### Q4 — Offline registry reading
+
+**Primary: python-registry**
+- Pure Python, parses raw hive files
+- Zero analysis-VM contamination (never loads into live registry)
+- One pip dependency, MIT licensed
+
+**Fallback: RegLoadAppKey (pywin32)**
+- Invoked only if python-registry fails to open the hive
+- Loads hive in isolated namespace (not into HKLM)
+- No cross-check between the two paths (only one runs per invocation)
+- Manifest records which method succeeded
+
+**On total failure:** hard error, abort processing, manifest documents both
+attempts.
+
+### Q5 — USN journal states
+
+usnproc handles all four possible journal states with distinct exit codes:
+
+| State | Behavior | Manifest flag |
+|---|---|---|
+| **1 — Normal** (journal + records) | Process normally | `complete` |
+| **2 — Disabled** (file exists, disabled) | Read what records are present, no recovery attempts | `partial` |
+| **3 — Empty** (file exists, no records) | Produce header-only `.evtx` + manifest | `empty` |
+| **4 — Missing** (no journal file) | Manifest only, no `.evtx` | `aborted` |
+
+### Exit code scheme
+
+| Code | Meaning |
+|---|---|
+| 0 | Success — normal processing complete (state 1) |
+| 1 | Success with note — empty journal (state 3) |
+| 2 | Success with note — disabled journal, partial records read (state 2) |
+| 3 | Aborted — journal missing (state 4) |
+| 4 | Aborted — journal corrupt/unparseable |
+| 5 | Aborted — SOFTWARE hive unreadable (can't get MachineGuid) |
+| 6 | Aborted — SYSTEM hive unreadable |
+| 7 | Aborted — drive invalid or not NTFS |
+| 8 | Aborted — output directory problem |
+| 9 | Aborted — insufficient privileges |
+| 10 | Aborted — command-line argument error |
+
+`--continue-on-error` behavior: silently record error, continue processing;
+final exit code reflects the worst non-fatal state reached.
+
+Default mode error-prompt flow:
+- First error: `Continue? [y/N]`
+- Second and subsequent errors: `Continue? [y]es / [i]gnore future / [n]o`
+- "Ignore future" = continue-on-error for the rest of the run
+- `--quiet` does NOT disable prompts (quiet only reduces output verbosity)
+
+### Q6 — Loop termination
+
+**Single-pass finite loop terminating at NextUsn.** Not usnmon's live-follow
+loop. Code-phase concern, no design decision needed beyond this note.
+
+### Q7 — Forensic mount tool
+
+**FTK Imager "File System / Read Only" mode** is the standardized mount tool.
+
+- Primary candidate — widely used and simple
+- Verification required before code phase: FTK Imager's mount driver must pass
+  through `FSCTL_QUERY_USN_JOURNAL` and `FSCTL_READ_USN_JOURNAL` IOCTLs
+- Verification script delivered: `usnproc_verify.py`
+- Documented alternatives if FTK Imager doesn't work: Arsenal Image Mounter,
+  OSFMount, imdisk
+
+**The verification script works against any mounter** — code is mount-tool-
+agnostic. The analyst picks a mounter, runs the verification once, knows if it
+works.
+
+### Q8 — Non-extractable identity fields
+
+Fields that don't exist in the offline image (SourceIP, MAC, FQDN, etc.):
+
+**Emit as empty string (`""`)**
+
+- Same schema as usnmon output
+- Downstream tools (EvtxECmd, Timeline Explorer, SIEM parsers) handle empty
+  fields cleanly
+- No literal placeholder strings that would break equality checks
+- Minimal event size impact
+
+### Q9 — Manifest schema
+
+JSON sidecar — one file per usnproc run. Documents provenance of the derived
+`.evtx`.
+
+```json
+{
+  "manifest_schema_version": "1.0",
+  "usnproc_version": "0.0.1",
+  "processing_timestamp_utc": "2026-11-24T19:24:00Z",
+  "processing_status": "complete | partial | empty | aborted",
+  "status_detail": "...",
+
+  "source_image": {
+    "image_hash_sha256_computed": "...",
+    "image_hash_sha256_examiner_supplied": "...",
+    "image_hash_match": true,
+    "image_path_at_processing": "E:\\cases\\...\\image.E01",
+    "mount_tool": "unknown",
+    "mount_drive_letter": "F:\\"
+  },
+
+  "source_machine_identity": {
+    "machine_guid": "a1b2c3d4-...",
+    "hostname": "...",
+    "domain": "...",
+    "os_product_name": "Windows 10 Pro",
+    "os_current_build": "19045",
+    "os_install_date_utc": "...",
+    "registered_owner": "...",
+    "registered_organization": "...",
+    "machine_sid": "S-1-5-21-..."
+  },
+
+  "volume": {
+    "drive_letter_at_processing": "F:\\",
+    "volume_serial_number": "D66FD839",
+    "filesystem": "NTFS"
+  },
+
+  "usn_journal": {
+    "journal_id": "0x01d5a1b2c3d40001",
+    "first_usn": 12345678,
+    "next_usn": 87654321,
+    "lowest_valid_usn": 0,
+    "max_usn": 9223372036854775807,
+    "max_size_bytes": 33554432,
+    "allocation_delta_bytes": 524288,
+    "records_extracted": 423891,
+    "records_failed_parse": 0
+  },
+
+  "processing_environment": {
+    "analysis_vm_hostname": "FORENSIC-VM-01",
+    "analysis_vm_user": "analyst",
+    "python_version": "3.12.1",
+    "registry_read_method": "python-registry",
+    "pywin32_version": "306",
+    "python_registry_version": "1.4"
+  },
+
+  "case": {
+    "case_id": "2026-0712-Ev003",
+    "case_notes": "..."
+  },
+
+  "output": {
+    "evtx_filename": "a1b2c3d4-..._2026-0712-Ev003.evtx",
+    "evtx_hash_sha256": "...",
+    "evtx_size_bytes": 785432109
+  },
+
+  "errors_and_warnings": [
+    {
+      "timestamp_utc": "2026-11-24T19:24:03.142Z",
+      "severity": "error | warning",
+      "code": "USN_PARSE_FAIL",
+      "detail": "Record at USN 12345 failed to parse: ..."
+    }
+  ]
+}
+```
+
+**Image hash handling:**
+- Always computed by default (hashing a large image takes minutes, but this is
+  forensic work)
+- `--image-hash <sha256>` input is a **verification check**, not a replacement
+  for computation
+- Mismatch between examiner-supplied and computed hashes is flagged loudly
+  (interactive prompt in default mode, documented in manifest in all modes)
+- Use case for mismatch flagging: **drive-labeling errors** — if the examiner's
+  hash is for a drive labeled "Windows 10" but our extracted MachineGuid comes
+  from a Windows 11 machine, something is mixed up in the chain of custody
+- `--image-path` optional. If omitted, skip hashing with manifest note
+  ("image hash skipped: image path not provided").
+- `--skip-image-hash` opts out of computing hash even with `--image-path` supplied
+- `--no-image-path` suppresses source image path from manifest (per-org policy)
+
+### Q10 — Analysis VM identity placement
+
+**Analysis VM identity in the manifest only.**
+
+- `.evtx` contains only source-image-derived data
+- Clean separation — analyst who receives the pair can trust the file's events
+  represent the source system
+- Manifest carries the "how it was processed" story
+- Maximum portability of the `.evtx`
+
+## Implementation notes
+
+### QPC / HiResUtc fields
+
+usnmon's event schema includes `Qpc` and `HiResUtc` fields from the recording
+machine's QueryPerformanceCounter. These are meaningless for offline processing
+of records that originated on a different machine at a different time.
+
+**Decision:** emit as empty strings with manifest note explaining why.
+
+### Source identity extraction
+
+For fields usnproc must pull from the mounted image:
+
+| Field | Source |
+|---|---|
+| MachineGuid | SOFTWARE hive → `Microsoft\Cryptography\MachineGuid` |
+| Hostname | SYSTEM hive → `ControlSet00X\Control\ComputerName\ComputerName` |
+| Domain | SYSTEM hive → `ControlSet00X\Services\Tcpip\Parameters\Domain` |
+| MachineSID | SAM hive |
+| OSBuild | SOFTWARE hive → `Microsoft\Windows NT\CurrentVersion\CurrentBuild` |
+| OS Product Name | SOFTWARE hive → `Microsoft\Windows NT\CurrentVersion\ProductName` |
+| Install date | SOFTWARE hive → `Microsoft\Windows NT\CurrentVersion\InstallDate` |
+| VolumeSerial | Boot sector of mounted image (via `GetVolumeInformation`) |
+| JournalId | From `FSCTL_QUERY_USN_JOURNAL` on mounted volume |
+| FQDN | Partial reconstruction from hostname + domain |
+| SourceIP | Not extractable (network state ephemeral) — empty string |
+| MAC | Registry-cached, may be stale — empty string in v0.0.1 |
+
+### Provider identification
+
+Events emitted by usnproc may use the same provider name as usnmon
+(`USNJournalMonitor`) to ensure EvtxECmd maps work without modification. This
+is a code-phase decision — alternative is `USNJournalMonitor.Offline` for
+downstream disambiguation. Trade-off between tool compatibility and
+offline-vs-live attribution.
+
+**Preliminary decision:** use same provider name (`USNJournalMonitor`) for
+EvtxECmd map compatibility. Record offline origin in the manifest instead.
+
+## Open items (noted for code phase, not design)
+
+### Pre-code verification required
+
+- **FTK Imager IOCTL pass-through:** run `usnproc_verify.py` against a test
+  image mounted with FTK Imager File System / Read Only mode. Confirm all 7
+  checks pass before proceeding with implementation.
+- **python-registry library API:** confirm current API hasn't drifted since
+  initial research.
+
+### Related project open items (not in scope for v0.0.1)
+
+**usnmon Pass 3:**
+- Error 1181 tight-retry storm (cursor aged out of ring → engine spams 916
+  warnings 1/sec forever instead of emitting 923 and resetting cursor)
+
+**logmon Pass 3:**
+- Boundary never advances after empty extraction
+- WARNING severity on empty-channel messages (should be INFO)
+- False-positive EXTERNAL CLEAR on cold boot after long shutdown
+
+## Ready-to-use artifacts
+
+- **usnproc_verify.py** — mount compatibility check (7 tests, delivered
+  previously)
+- **test_usnproc_verify.py** — 41-test mock suite covering all branch logic
+- This document — complete design lock
+
+## Workflow
+
+Once implementation is complete, the analyst workflow will be:
+
+1. Acquire forensic image using existing tools (FTK Imager, Guymager, etc.)
+2. Mount image read-only in forensic analysis VM (FTK Imager File System mode)
+3. One-time: run `usnproc_verify.py F` to confirm mount compatibility
+4. Run `usnproc.py F --case 2026-0712-Ev003`
+5. usnproc extracts source machine identity, walks the USN journal, produces:
+   - `{MachineGuid}_{CaseID}.evtx` — ready for EvtxECmd / Timeline Explorer
+   - `{MachineGuid}_{CaseID}.manifest.json` — chain of custody
+6. Analyst runs their existing analyzer tools against the `.evtx`
+
+## Design freeze
+
+This document locks the design for v0.0.1. Future revisions will create a
+new version of this document; the Q&A decisions above are not open for
+re-litigation without a specific technical reason to revisit.
+
+---
+
+**End of DESIGN_LOCK v1.0**
