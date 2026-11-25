@@ -1,7 +1,7 @@
 # usnproc v0.0.1 — Design Lock
 
-**Document version:** 1.2
-**Date:** 2026-11-25 (v1.1 2026-11-24, v1.2 2026-11-25; see Change log)
+**Document version:** 1.3
+**Date:** 2026-11-25 (v1.1 2026-11-24, v1.2–v1.3 2026-11-25; see Change log)
 **Status:** Design locked — ready for implementation
 **Target:** usnproc v0.0.1
 **Maintainer:** YASDC, Inc.
@@ -135,6 +135,14 @@ ONE record that says so, instead of being header-only or absent:
   followed by the state, the reason, the volume (source drive letter, Q12),
   VolumeSerial, Hostname and MachineGuid.
 - TimeCreated: see Q11. Never the processing time.
+
+**Truncation record (v1.3).** If reading stops partway (a journal read
+fails, or the analyst stops at a parse-failure prompt) after some events
+were written, those events are kept and ONE EventID **916** record is
+appended at the end: `USN Journal read failed before the end of the
+journal.` followed by the reason, the number of records written, the last
+USN written, and the volume identity. TimeCreated = the last written
+record's own USN Timestamp, so it sorts right after that event.
 
 ### Exit code scheme
 
@@ -323,7 +331,8 @@ any event.
 TimeCreated = the source system's last shutdown time, read from the image's
 SYSTEM hive (`ControlSet00X\Control\Windows\ShutdownTime`, a FILETIME).
 If the image has no ShutdownTime, TimeCreated = 1601-01-01 (FILETIME zero).
-Both choices are stated in the record text.
+Both choices are stated in the record text. The truncation record (Q5)
+uses the last written USN record's Timestamp.
 
 This is why usnproc uses a native EVTX writer instead of `ReportEvent`:
 `ReportEvent` would stamp `TimeCreated` with the processing time and
@@ -339,8 +348,11 @@ and what other artifacts from the image show.
 - Source letter = the drive in `SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRoot`
   (e.g. `C:\Windows` → `C:\`). usnproc needs the SOFTWARE hive on the
   volume, so the volume is always that system's Windows volume.
-- If SystemRoot is missing: paths start with `?:\`, plus a manifest warning
-  (`SOURCE_DRIVE_LETTER_UNKNOWN`). The mount letter is never used in events.
+- If SystemRoot is missing (v1.3): the volume's own **VolumeSerial** takes
+  the place of the letter, e.g. `D66FD839:\Users\...`, plus a manifest
+  warning (`SOURCE_DRIVE_LETTER_UNKNOWN`). The VolumeSerial comes from the
+  image's boot sector, so it is the same on every analysis machine. The
+  mount letter is never used in events.
 - The manifest records both: `volume.drive_letter_at_processing` (mount
   letter) and `volume.drive_letter_on_source_system`, with its basis.
 - The volume is also identified in every event by `VolumeSerial`.
@@ -438,6 +450,10 @@ re-litigation without a specific technical reason to revisit.
 
 ## Change log
 
+- **v1.3 (2026-11-25):** Q5: a read that stops partway appends one 916
+  truncation record, timed at the last written USN record. Q12: when the
+  source letter is unknown, paths use the VolumeSerial (`D66FD839:\`)
+  instead of `?:\`.
 - **v1.2 (2026-11-25):** Q5: empty, disabled, missing and corrupt journals
   each produce an `.evtx` holding one status record (EventID 919 / 916),
   instead of header-only or no `.evtx`. Q11: the status record's TimeCreated

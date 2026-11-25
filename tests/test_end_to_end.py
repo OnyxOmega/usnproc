@@ -205,7 +205,7 @@ class E2E(unittest.TestCase):
         if PyEvtx:
             with PyEvtx(ev) as log:
                 x = [r.xml() for r in log.records()][7]
-            self.assertIn("<Data>?:\\root.log</Data>", x)
+            self.assertIn("<Data>D66FD839:\\root.log</Data>", x)
 
     def test_read_failure_midway_exit_4_partial(self):
         recs = sample_journal()
@@ -214,6 +214,29 @@ class E2E(unittest.TestCase):
         code, man, ev = self.run_usnproc(fj, ["--continue-on-error"])
         self.assertEqual((code, man["processing_status"]), (4, "partial"))
         self.assertEqual(man["usn_journal"]["records_extracted"], 6)
+        if PyEvtx:
+            with PyEvtx(ev) as log:
+                recs = [(r.timestamp(), r.xml()) for r in log.records()]
+            self.assertEqual(len(recs), 7)                       # 6 events + 916
+            ts, x = recs[-1]
+            self.assertIn(">916</EventID>", x)
+            self.assertIn("USN Journal read failed before the end of the journal.", x)
+            self.assertIn("6 records were written; the last was USN %d." % fj.usns[5], x)
+            self.assertEqual(ts, recs[5][0])                     # last record's time
+
+    def test_parse_abort_midway_adds_916(self):
+        fj = fakes.FakeJournal(sample_journal(), per_read=8)
+        bad = bytearray(fj.records[3])
+        bad[4] = 9                                               # unsupported major
+        fj.records[3] = bytes(bad)
+        code, man, ev = self.run_usnproc(fj, answers=["n"])
+        self.assertEqual((code, man["processing_status"]), (4, "aborted"))
+        if PyEvtx:
+            with PyEvtx(ev) as log:
+                xs = [r.xml() for r in log.records()]
+            self.assertEqual(len(xs), 4)
+            self.assertIn(">916</EventID>", xs[-1])
+            self.assertIn("aborted by analyst after USN_PARSE_FAIL", xs[-1])
 
     def test_software_hive_exit_5_unknown_name(self):
         code, man, ev = self.run_usnproc(fakes.FakeJournal(sample_journal()),

@@ -5,7 +5,7 @@
 > Inputs: `DESIGN_LOCK.md` v1.0 (this repo) and usnmon at
 > `OnyxOmega/USNJournal2EventLog` commit `bd09f19` (`usnmon.py`, `usn_common.py`,
 > `EVENT_ID.md`, `maps/`).
-> This plan follows the design lock. It does not reopen Q1–Q12 (lock v1.2). Section 3
+> This plan follows the design lock. It does not reopen Q1–Q12 (lock v1.3). Section 3
 > lists the places where the lock is silent, or where the reused code behaves
 > differently offline. Each one needs a decision before or during coding.
 
@@ -77,7 +77,8 @@ contract-parity unit test (section 6) catches any drift.
 | D6 | **Never overwrite.** Add the processing time to the file names so repeat runs make new files: `{MachineGuid}[_{CaseID}]_{YYYYMMDDTHHMMSSZ}.evtx` and the matching `.manifest.json`. The timestamp is `processing_timestamp_utc` in compact form, the same value in both names. If a file still exists (two runs in the same second) → exit 8. DESIGN_LOCK.md Q1 updated (v1.1). | Decided |
 
 | D7 | **Status record** when no USN records can be extracted (empty, disabled, missing, corrupt): one 919/916 event, TimeCreated = image ShutdownTime (1601-01-01 if absent). DESIGN_LOCK Q5/Q11 v1.2. Replaces the header-only/no-`.evtx` behavior. | Decided 2026-11-25 |
-| D8 | **Source drive letter in paths** from SOFTWARE SystemRoot; `?:` if unknown; never the mount letter. DESIGN_LOCK Q12. | Decided 2026-11-25 |
+| D8 | **Source drive letter in paths** from SOFTWARE SystemRoot; if unknown, the VolumeSerial in its place (`D66FD839:\`); never the mount letter. DESIGN_LOCK Q12. | Decided 2026-11-25 |
+| D9 | **Truncation record:** a read that stops partway appends one 916 record, TimeCreated = last written USN record. DESIGN_LOCK Q5. | Decided 2026-11-25 |
 
 The original analysis of each option follows.
 

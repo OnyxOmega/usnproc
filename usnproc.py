@@ -54,7 +54,6 @@ EXIT_PRIVILEGE = 9
 EXIT_ARGS = 10
 
 UNKNOWN_GUID = "UNKNOWN"
-UNKNOWN_DRIVE = "?:\\"
 STATE_CORRUPT = "corrupt"
 
 NOTE_QPC = ("Qpc and HiResUtc are emitted as empty strings: they are "
@@ -357,11 +356,16 @@ class Run:
                        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SystemRoot = %s"
                        % identity["system_root"])
         else:
-            self.path_root = UNKNOWN_DRIVE
+            # Fallback: the image's own VolumeSerial in place of the letter,
+            # e.g. "D66FD839:\\Users\\..." -- never the analysis mount letter.
+            self.path_root = self.volume_serial + ":\\"
             vol.update(drive_letter_on_source_system=None,
-                       drive_letter_on_source_system_basis="SystemRoot not found in SOFTWARE hive")
+                       drive_letter_on_source_system_basis=
+                       "SystemRoot not found in SOFTWARE hive; event paths use "
+                       "VolumeSerial '%s' in place of the drive letter" % self.path_root)
             self.manifest.add_error("warning", "SOURCE_DRIVE_LETTER_UNKNOWN",
-                                    "SystemRoot missing; event paths use '%s'" % UNKNOWN_DRIVE)
+                                    "SystemRoot missing; event paths use VolumeSerial "
+                                    "'%s' in place of the drive letter" % self.path_root)
         if not sysid["hostname"]:
             self.manifest.add_error("warning", "HOSTNAME_NOT_FOUND",
                                     "ComputerName not found under %s" % sysid["control_set"])
@@ -479,6 +483,22 @@ class Run:
         self.manifest.add_note("status record written (EventID %d, state %s): no USN "
                                "records were extracted." % (event_id, state))
 
+    def write_truncation_record(self, writer, last_ts, last_usn, n_ok, reason):
+        """Q5/Q11: reading stopped before the end of the journal. Append ONE
+        916 record after the events already written. TimeCreated = the last
+        good USN record's own Timestamp (journal data, never the processing
+        time), so it sorts right after the last event that made it in."""
+        text = ("USN Journal read failed before the end of the journal. %s. "
+                "%d records were written; the last was USN %d. Records after it "
+                "are NOT in this file. Volume %s VolumeSerial %s, Hostname %s, "
+                "MachineGuid %s. TimeCreated is the last written record's USN "
+                "timestamp."
+                % (reason.rstrip("."), n_ok, last_usn, self.path_root, self.volume_serial,
+                   self.identity["hostname"] or "?", self.identity["machine_guid"]))
+        writer.write(916, last_ts, [text], level=evtx.LEVEL_WARNING)
+        self.manifest.add_note("truncation record written (EventID 916) after %d events; "
+                               "last USN %d." % (n_ok, last_usn))
+
     def _process_volume(self, h_vol):
         d = self.args.drive
         evtx_name = self.names()[0]
@@ -525,6 +545,7 @@ class Run:
         resolver = journal.PathResolver(h_vol, self.path_root, pmap)
         base = base_values(self.identity, self.volume_serial, jd.journal_id)
         n_ok = n_bad = 0
+        last_ts = last_usn = 0
         code, status, final_detail = EXIT_OK, mf.STATUS_COMPLETE, "all records processed"
         self.console.info("Pass 2/2: writing events -> %s" % evtx_name)
         writer = evtx.EvtxWriter(self.evtx_path, computer=self.identity["hostname"])
@@ -543,6 +564,7 @@ class Run:
                 event_id, values = build_values(base, rec, resolver.resolve(rec))
                 writer.write(event_id, rec["timestamp"], common.build_event_strings(values))
                 n_ok += 1
+                last_ts, last_usn = rec["timestamp"], rec["usn"]
                 if n_ok % 50000 == 0:
                     self.console.info("  %d events written ..." % n_ok)
         except journal.JournalError as exc:
@@ -555,6 +577,8 @@ class Run:
             elif n_ok == 0:
                 self.write_status_record(journal.STATE_EMPTY,
                                          "journal returned no records", writer)
+            elif code != EXIT_OK:
+                self.write_truncation_record(writer, last_ts, last_usn, n_ok, final_detail)
             writer.close()
             uj.update(records_extracted=n_ok, records_failed_parse=n_bad,
                       paths_resolved_live=resolver.stats["resolved_live"],
