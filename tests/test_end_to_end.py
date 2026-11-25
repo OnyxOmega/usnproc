@@ -94,6 +94,10 @@ class E2E(unittest.TestCase):
         self.assertEqual(man["output"]["evtx_filename"], stem + ".evtx")
         self.assertEqual(man["output"]["evtx_size_bytes"], os.path.getsize(ev))
         self.assertIn(usnproc.NOTE_NO_IMAGE_PATH, man["notes"])
+        self.assertEqual(man["volume"]["drive_letter_on_source_system"], "C:\\")
+        self.assertEqual(man["volume"]["drive_letter_at_processing"], "F:\\")
+        self.assertEqual(man["source_machine_identity"]["last_shutdown_utc"],
+                         journal.filetime_to_iso(fakes.SHUTDOWN_FT))
         self.assertEqual(man["processing_environment"]["registry_read_method"]["SOFTWARE"],
                          "python-registry")
 
@@ -111,43 +115,97 @@ class E2E(unittest.TestCase):
             self.assertIn("UtcTime: " + journal.filetime_to_utc_str(FT0 + i * 10_000_000), x)
             self.assertNotIn(processed_day, x)                              # no "now"
             self.assertIn("<Computer>SRCHOST</Computer>", x)
+            self.assertNotIn("F:", x)                                       # no mount letter
             self.assertIn("HiResUtc: \n", x)
             self.assertIn("Qpc: </Data>", x)
         texts = [x for _, x in recs]
-        self.assertIn("<Data>F:\\Users\\bob\\doc.txt</Data>", texts[2])     # live path
-        self.assertIn("<Data>F:\\Old\\gone.tmp</Data>", texts[5])          # rebuilt (D3)
-        self.assertIn("<Data>F:\\root.log</Data>", texts[7])
+        self.assertIn("<Data>C:\\Users\\bob\\doc.txt</Data>", texts[2])     # live path
+        self.assertIn("<Data>C:\\Old\\gone.tmp</Data>", texts[5])          # rebuilt (D3)
+        self.assertIn("<Data>C:\\root.log</Data>", texts[7])
         self.assertIn(">102</EventID>", texts[5])                           # Delete
         # "Users" (ref 30) is not live in the fake mount and "Old" is deleted:
         # both are rebuilt from the journal.
         self.assertEqual(man["usn_journal"]["paths_resolved_from_journal"], 2)
 
+    def status_record(self, ev, want_eid):
+        """The .evtx must hold exactly ONE status record, timed at the image's
+        ShutdownTime -- never the processing time (Q11)."""
+        data = open(ev, "rb").read()
+        self.assertGreater(len(data), 4096)
+        if PyEvtx is None:
+            return None
+        with PyEvtx(ev) as log:
+            recs = [(r.timestamp(), r.xml()) for r in log.records()]
+        self.assertEqual(len(recs), 1)
+        ts, x = recs[0]
+        self.assertEqual(ts, journal.filetime_to_datetime(fakes.SHUTDOWN_FT))
+        self.assertIn(">%d</EventID>" % want_eid, x)
+        self.assertIn("<Level>3</Level>", x)
+        self.assertIn("USN Journal logging not enabled, missing or corrupt.", x)
+        self.assertIn("Volume C:\\", x)
+        self.assertNotIn("F:", x)
+        self.assertEqual(x.count("<Data>"), 1)
+        return x
+
     def test_empty_journal_exit_1(self):
         code, man, ev = self.run_usnproc(fakes.FakeJournal([]))
         self.assertEqual((code, man["processing_status"]), (1, "empty"))
-        self.assertEqual(os.path.getsize(ev), 4096)
+        x = self.status_record(ev, 919)
+        if x:
+            self.assertIn("State: empty", x)
 
     def test_disabled_exit_2(self):
         e = OSError("x")
         e.winerror = 1179
         code, man, ev = self.run_usnproc(fakes.FakeJournal([], query_error=e))
         self.assertEqual((code, man["processing_status"]), (2, "partial"))
-        self.assertIsNotNone(ev)
+        x = self.status_record(ev, 919)
+        if x:
+            self.assertIn("State: disabled", x)
 
-    def test_missing_exit_3_manifest_only(self):
-        e = OSError("x")
-        e.winerror = 1179
-        fj = fakes.FakeJournal([], query_error=e)
+    def test_missing_exit_3_status_record(self):
+        fj = fakes.FakeJournal([])
         with mock.patch.object(journal, "detect_journal_state",
-                               return_value=(journal.STATE_MISSING, None, "none")):
+                               return_value=(journal.STATE_MISSING, None, "no USN journal")):
             code, man, ev = self.run_usnproc(fj)
-        self.assertEqual((code, man["processing_status"], ev), (3, "aborted", None))
+        self.assertEqual((code, man["processing_status"]), (3, "aborted"))
+        x = self.status_record(ev, 919)
+        if x:
+            self.assertIn("State: missing", x)
+        self.assertEqual(man["output"]["evtx_filename"], os.path.basename(ev))
 
-    def test_unsupported_mount_exit_4(self):
+    def test_unsupported_mount_exit_4_status_record(self):
         e = OSError("x")
         e.winerror = 1
         code, man, ev = self.run_usnproc(fakes.FakeJournal([], query_error=e))
         self.assertEqual((code, man["processing_status"]), (4, "aborted"))
+        x = self.status_record(ev, 916)
+        if x:
+            self.assertIn("State: corrupt", x)
+
+    def test_no_shutdown_time_uses_1601(self):
+        system = dict(fakes.SYSTEM)
+        del system[(r"ControlSet001\Control\Windows", "ShutdownTime")]
+        code, man, ev = self.run_usnproc(fakes.FakeJournal([]), hives={
+            "SOFTWARE": fakes.SOFTWARE, "SYSTEM": system, "SAM": fakes.SAM})
+        self.assertEqual(code, 1)
+        data = open(ev, "rb").read()
+        self.assertEqual(int.from_bytes(data[4096 + 512 + 16:4096 + 512 + 24], "little"), 0)
+
+    def test_unknown_source_drive_letter(self):
+        sw = dict(fakes.SOFTWARE)
+        del sw[(r"Microsoft\Windows NT\CurrentVersion", "SystemRoot")]
+        code, man, ev = self.run_usnproc(fakes.FakeJournal(sample_journal()),
+                                         ["--continue-on-error"],
+                                         hives={"SOFTWARE": sw, "SYSTEM": fakes.SYSTEM,
+                                                "SAM": fakes.SAM})
+        self.assertEqual(code, 0)
+        self.assertIsNone(man["volume"]["drive_letter_on_source_system"])
+        self.assertEqual(man["errors_and_warnings"][0]["code"], "SOURCE_DRIVE_LETTER_UNKNOWN")
+        if PyEvtx:
+            with PyEvtx(ev) as log:
+                x = [r.xml() for r in log.records()][7]
+            self.assertIn("<Data>?:\\root.log</Data>", x)
 
     def test_read_failure_midway_exit_4_partial(self):
         recs = sample_journal()

@@ -12,6 +12,7 @@ Only one method runs per hive; the manifest records which one succeeded and
 every attempt made.
 """
 
+import re
 import struct
 from datetime import datetime, timezone
 
@@ -162,6 +163,22 @@ def _s(v):
     return "" if v is None else str(v)
 
 
+def drive_letter_of(path):
+    """'C:\\Windows' -> 'C:'; '' if no drive letter."""
+    m = re.match(r"\s*([A-Za-z]):", path or "")
+    return m.group(1).upper() + ":" if m else ""
+
+
+def filetime_from_reg(v):
+    """ShutdownTime is REG_BINARY holding an 8-byte FILETIME."""
+    if isinstance(v, (bytes, bytearray)) and len(v) >= 8:
+        ft = struct.unpack_from("<Q", bytes(v), 0)[0]
+        return ft or None
+    if isinstance(v, int) and v > 0:
+        return v
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Identity
 # --------------------------------------------------------------------------- #
@@ -183,6 +200,7 @@ def read_software_identity(software):
         "os_install_date_utc": epoch_to_iso(software.get_value(cv, "InstallDate")),
         "registered_owner": _s(software.get_value(cv, "RegisteredOwner")),
         "registered_organization": _s(software.get_value(cv, "RegisteredOrganization")),
+        "system_root": _s(software.get_value(cv, "SystemRoot")),
     }
 
 
@@ -191,7 +209,9 @@ def read_system_identity(system):
     host = system.get_value(cs + r"\Control\ComputerName\ComputerName", "ComputerName")
     tcpip = cs + r"\Services\Tcpip\Parameters"
     domain = system.get_value(tcpip, "Domain") or system.get_value(tcpip, "NV Domain")
-    return {"hostname": _s(host), "domain": _s(domain), "control_set": cs}
+    shutdown = filetime_from_reg(system.get_value(cs + r"\Control\Windows", "ShutdownTime"))
+    return {"hostname": _s(host), "domain": _s(domain), "control_set": cs,
+            "shutdown_filetime": shutdown}
 
 
 def read_machine_sid(sam):

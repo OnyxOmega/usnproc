@@ -118,9 +118,12 @@ class Manifest:
                 "os_product_name": "", "os_current_build": "",
                 "os_install_date_utc": "", "registered_owner": "",
                 "registered_organization": "", "machine_sid": "",
+                "system_root": "", "last_shutdown_utc": "",
             },
             "volume": {
                 "drive_letter_at_processing": None,
+                "drive_letter_on_source_system": None,
+                "drive_letter_on_source_system_basis": "",
                 "volume_serial_number": "",
                 "filesystem": "",
             },

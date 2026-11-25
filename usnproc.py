@@ -54,6 +54,8 @@ EXIT_PRIVILEGE = 9
 EXIT_ARGS = 10
 
 UNKNOWN_GUID = "UNKNOWN"
+UNKNOWN_DRIVE = "?:\\"
+STATE_CORRUPT = "corrupt"
 
 NOTE_QPC = ("Qpc and HiResUtc are emitted as empty strings: they are "
             "recording-machine QueryPerformanceCounter values that do not exist "
@@ -342,7 +344,24 @@ class Run:
                                        r"(Microsoft\Cryptography\MachineGuid)")
         self.machine_guid = identity["machine_guid"]
         sysid = reg.read_system_identity(hives["SYSTEM"])
-        identity.update(hostname=sysid["hostname"], domain=sysid["domain"])
+        identity.update(hostname=sysid["hostname"], domain=sysid["domain"],
+                        shutdown_filetime=sysid["shutdown_filetime"])
+        identity["last_shutdown_utc"] = journal.filetime_to_iso(sysid["shutdown_filetime"])
+        # Q12: paths use the drive letter the SOURCE system used for this volume.
+        orig = reg.drive_letter_of(identity["system_root"])
+        vol = self.manifest.section("volume")
+        if orig:
+            self.path_root = orig + "\\"
+            vol.update(drive_letter_on_source_system=self.path_root,
+                       drive_letter_on_source_system_basis=
+                       "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SystemRoot = %s"
+                       % identity["system_root"])
+        else:
+            self.path_root = UNKNOWN_DRIVE
+            vol.update(drive_letter_on_source_system=None,
+                       drive_letter_on_source_system_basis="SystemRoot not found in SOFTWARE hive")
+            self.manifest.add_error("warning", "SOURCE_DRIVE_LETTER_UNKNOWN",
+                                    "SystemRoot missing; event paths use '%s'" % UNKNOWN_DRIVE)
         if not sysid["hostname"]:
             self.manifest.add_error("warning", "HOSTNAME_NOT_FOUND",
                                     "ComputerName not found under %s" % sysid["control_set"])
@@ -432,11 +451,42 @@ class Run:
             except Exception:               # noqa: BLE001
                 pass
 
+    def write_status_record(self, state, detail, writer=None):
+        """Q5/Q11: when no USN records can be produced, write ONE record that
+        says so. 919 (no active journal) for empty/disabled/missing, 916
+        (journal failure) for corrupt -- usnmon's operational event IDs and
+        maps. TimeCreated = the source system's last ShutdownTime (image
+        data); 1601-01-01 if the image has none. Never the processing time."""
+        ft = self.identity.get("shutdown_filetime") or 0
+        event_id = 916 if state == STATE_CORRUPT else 919
+        msg = "USN Journal logging not enabled, missing or corrupt."
+        when = ("TimeCreated is the source system's last shutdown time "
+                "(SYSTEM ShutdownTime); no USN record exists to supply a time."
+                if ft else "TimeCreated is 1601-01-01: no USN record exists and the "
+                           "image has no ShutdownTime.")
+        text = ("%s State: %s. %s. Volume %s VolumeSerial %s, Hostname %s, MachineGuid %s. %s"
+                % (msg, state, detail.rstrip("."), self.path_root, self.volume_serial,
+                   self.identity["hostname"] or "?", self.identity["machine_guid"], when))
+        own = writer is None
+        if own:
+            writer = evtx.EvtxWriter(self.evtx_path, computer=self.identity["hostname"])
+        try:
+            writer.write(event_id, ft, [text], level=evtx.LEVEL_WARNING)
+        finally:
+            if own:
+                writer.close()
+                self._record_output()
+        self.manifest.add_note("status record written (EventID %d, state %s): no USN "
+                               "records were extracted." % (event_id, state))
+
     def _process_volume(self, h_vol):
         d = self.args.drive
+        evtx_name = self.names()[0]
+        self.evtx_path = os.path.join(self.args.output, evtx_name)
         try:
             state, jd, detail = journal.detect_journal_state(d, h_vol)
         except journal.JournalError as exc:
+            self.write_status_record(STATE_CORRUPT, str(exc))
             raise Abort(EXIT_CORRUPT, str(exc))
         uj = self.manifest.section("usn_journal")
         if jd is not None:
@@ -445,19 +495,17 @@ class Run:
                       max_usn=jd.max_usn, max_size_bytes=jd.max_size,
                       allocation_delta_bytes=jd.allocation_delta)
         self.console.info("Journal state: %s (%s)" % (state, detail))
-        evtx_name = self.names()[0]
-        self.evtx_path = os.path.join(self.args.output, evtx_name)
 
         if state == journal.STATE_MISSING:
+            self.write_status_record(state, detail)
             raise Abort(EXIT_MISSING, detail)
         if state in (journal.STATE_EMPTY, journal.STATE_DISABLED):
-            evtx.write_empty(self.evtx_path)
-            self._record_output()
+            self.write_status_record(state, detail)
             if state == journal.STATE_EMPTY:
                 return EXIT_EMPTY, mf.STATUS_EMPTY, detail
             self.manifest.add_note("journal disabled: no records are readable through "
                                    "FSCTL_READ_USN_JOURNAL; raw $UsnJrnl:$J reading is "
-                                   "not implemented in v0.0.1. Header-only .evtx written.")
+                                   "not implemented in v0.0.1.")
             return EXIT_DISABLED, mf.STATUS_PARTIAL, detail
 
         stop_usn = jd.next_usn                 # captured once at start (Q6)
@@ -470,10 +518,11 @@ class Run:
                 pmap.note(rec)
         except journal.JournalError as exc:
             if not self.policy.handle("error", "USN_READ_FAIL", "pass 1: %s" % exc):
+                self.write_status_record(STATE_CORRUPT, str(exc))
                 raise Abort(EXIT_CORRUPT, str(exc))
         self.console.verbose("  %d journal entries mapped" % len(pmap.entries))
 
-        resolver = journal.PathResolver(h_vol, d, pmap)
+        resolver = journal.PathResolver(h_vol, self.path_root, pmap)
         base = base_values(self.identity, self.volume_serial, jd.journal_id)
         n_ok = n_bad = 0
         code, status, final_detail = EXIT_OK, mf.STATUS_COMPLETE, "all records processed"
@@ -501,6 +550,11 @@ class Run:
             code, status = EXIT_CORRUPT, mf.STATUS_PARTIAL
             final_detail = "journal read failed after %d records: %s" % (n_ok, exc)
         finally:
+            if n_ok == 0 and code != EXIT_OK:
+                self.write_status_record(STATE_CORRUPT, final_detail, writer)
+            elif n_ok == 0:
+                self.write_status_record(journal.STATE_EMPTY,
+                                         "journal returned no records", writer)
             writer.close()
             uj.update(records_extracted=n_ok, records_failed_parse=n_bad,
                       paths_resolved_live=resolver.stats["resolved_live"],

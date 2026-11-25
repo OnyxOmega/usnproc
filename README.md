@@ -37,7 +37,7 @@ custom parser required.
 ## Status
 
 **v0.0.1 implemented, pending field testing on Windows.** The design is
-locked (see [DESIGN_LOCK.md](DESIGN_LOCK.md) v1.1), and the build follows
+locked (see [DESIGN_LOCK.md](DESIGN_LOCK.md) v1.2), and the build follows
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md). The test suite runs on any
 OS with simulated volumes and hives. It still has to be run against a real
 image mounted with FTK Imager.
@@ -62,8 +62,13 @@ Outputs, never overwritten:
 
 Events contain **only USN journal and source-image data**. `TimeCreated` and
 `UtcTime` are the USN record's own timestamp, and `Computer` is the source
-machine's hostname. The processing time appears only in the file names and
-the manifest.
+machine's hostname. Paths use the drive letter the source system used (from
+SystemRoot, e.g. `C:\Users\...`), not the mount letter. The processing time
+appears only in the file names and the manifest.
+
+If the journal is empty, disabled, missing or unreadable, the `.evtx` holds
+one status record (EventID 919 or 916) saying "USN Journal logging not
+enabled, missing or corrupt", timed at the source system's last shutdown.
 
 Options: `--case`, `--case-notes`, `--output`, `--image-path`,
 `--image-hash`, `--skip-image-hash`, `--no-image-path`,

@@ -52,6 +52,7 @@ S_PROVIDER, S_QUAL, S_EID, S_LEVEL, S_TASK, S_KEYWORDS, S_TIME, S_RECID, \
     S_CHANNEL, S_COMPUTER = range(10)
 N_FIXED = 10
 CLASSIC_KEYWORDS = 0x0080000000000000   # what ReportEvent events carry
+LEVEL_WARNING, LEVEL_INFO = 3, 4
 
 
 def _crc32(data):
@@ -265,12 +266,12 @@ class EvtxWriter:
         self.next_record_id = 1
         self.count = 0
 
-    def write(self, event_id, filetime, strings):
+    def write(self, event_id, filetime, strings, level=LEVEL_INFO):
         """event_id: int; filetime: record time (FILETIME ticks);
-        strings: EventData <Data> values in order."""
+        strings: EventData <Data> values in order; level: 4 info, 3 warning."""
         values = [
             (T_WSTR, self.provider), (T_UINT16, 0), (T_UINT16, event_id),
-            (T_UINT8, 4), (T_UINT16, 0), (T_HEX64, CLASSIC_KEYWORDS),
+            (T_UINT8, level), (T_UINT16, 0), (T_HEX64, CLASSIC_KEYWORDS),
             (T_FILETIME, filetime), (T_UINT64, self.next_record_id),
             (T_WSTR, self.channel), (T_WSTR, self.computer),
         ] + [(T_WSTR, str(s)) for s in strings]

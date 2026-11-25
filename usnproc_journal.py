@@ -71,6 +71,12 @@ def filetime_to_datetime(ft):
     return _EPOCH_1601 + timedelta(microseconds=ft // 10)
 
 
+def filetime_to_iso(ft):
+    if not ft or ft < 0:
+        return ""
+    return filetime_to_datetime(ft).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def filetime_to_utc_str(ft):
     """FILETIME -> usnmon UtcTime format 'YYYY-MM-DD HH:MM:SS.mmmZ'."""
     if not ft or ft < 0:

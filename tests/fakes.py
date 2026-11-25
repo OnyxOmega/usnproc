@@ -129,6 +129,7 @@ def sam_v_blob(a=1111111111, b=2222222222, c=3333333333):
     return b"\x00" * 40 + bytes([1, 4, 0, 0, 0, 0, 0, 5]) + struct.pack("<IIII", 21, a, b, c)
 
 
+SHUTDOWN_FT = 133_600_000_000_000_000   # 2024-05-12, from the image
 GUID = "a1b2c3d4-e5f6-7890-abcd-ef0123456789"
 
 SOFTWARE = {
@@ -138,10 +139,12 @@ SOFTWARE = {
     (r"Microsoft\Windows NT\CurrentVersion", "InstallDate"): 1700000000,
     (r"Microsoft\Windows NT\CurrentVersion", "RegisteredOwner"): "owner",
     (r"Microsoft\Windows NT\CurrentVersion", "RegisteredOrganization"): "org",
+    (r"Microsoft\Windows NT\CurrentVersion", "SystemRoot"): "C:\\WINDOWS",
 }
 SYSTEM = {
     ("Select", "Current"): 1,
     (r"ControlSet001\Control\ComputerName\ComputerName", "ComputerName"): "SRCHOST",
     (r"ControlSet001\Services\Tcpip\Parameters", "Domain"): "corp.example",
+    (r"ControlSet001\Control\Windows", "ShutdownTime"): struct.pack("<Q", SHUTDOWN_FT),
 }
 SAM = {(r"SAM\Domains\Account", "V"): sam_v_blob()}

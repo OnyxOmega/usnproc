@@ -1,7 +1,7 @@
 # usnproc v0.0.1 — Design Lock
 
-**Document version:** 1.1
-**Date:** 2026-11-24 (v1.1 amendment same day; see Change log)
+**Document version:** 1.2
+**Date:** 2026-11-25 (v1.1 2026-11-24, v1.2 2026-11-25; see Change log)
 **Status:** Design locked — ready for implementation
 **Target:** usnproc v0.0.1
 **Maintainer:** YASDC, Inc.
@@ -119,9 +119,22 @@ usnproc handles all four possible journal states with distinct exit codes:
 | State | Behavior | Manifest flag |
 |---|---|---|
 | **1 — Normal** (journal + records) | Process normally | `complete` |
-| **2 — Disabled** (file exists, disabled) | Read what records are present, no recovery attempts | `partial` |
-| **3 — Empty** (file exists, no records) | Produce header-only `.evtx` + manifest | `empty` |
-| **4 — Missing** (no journal file) | Manifest only, no `.evtx` | `aborted` |
+| **2 — Disabled** (file exists, disabled) | Read what records are present, no recovery attempts. If none: one status record (see below) | `partial` |
+| **3 — Empty** (file exists, no records) | `.evtx` with one status record + manifest | `empty` |
+| **4 — Missing** (no journal file) | `.evtx` with one status record + manifest | `aborted` |
+
+**Status record (v1.2).** Whenever no USN records can be extracted (empty,
+disabled, missing, or corrupt/unreadable, exit 4), the `.evtx` holds exactly
+ONE record that says so, instead of being header-only or absent:
+
+- EventID **919** (usnmon "no active USN journal") for empty, disabled and
+  missing. EventID **916** (usnmon "drive/journal failure") for corrupt or
+  unreadable. Level 3 (warning). This matches usnmon's operational events
+  and its EvtxECmd maps (PayloadData1 = `Data[1]`).
+- One `Data` string: `USN Journal logging not enabled, missing or corrupt.`
+  followed by the state, the reason, the volume (source drive letter, Q12),
+  VolumeSerial, Hostname and MachineGuid.
+- TimeCreated: see Q11. Never the processing time.
 
 ### Exit code scheme
 
@@ -306,9 +319,31 @@ any event.
 - Note for analysts: the USN `Timestamp` is when NTFS logged the change in
   the journal. It is not the file's `$STANDARD_INFORMATION` times.
 
+**Status record time (v1.2).** When no USN record exists (Q5 status record),
+TimeCreated = the source system's last shutdown time, read from the image's
+SYSTEM hive (`ControlSet00X\Control\Windows\ShutdownTime`, a FILETIME).
+If the image has no ShutdownTime, TimeCreated = 1601-01-01 (FILETIME zero).
+Both choices are stated in the record text.
+
 This is why usnproc uses a native EVTX writer instead of `ReportEvent`:
 `ReportEvent` would stamp `TimeCreated` with the processing time and
 `Computer` with the analysis VM's name.
+
+### Q12 — Drive letter in event paths (v1.2)
+
+**Paths use the drive letter the SOURCE system used for this volume**, not
+the analysis VM's mount letter. Mount letters change from machine to machine;
+the source letter matches what live usnmon would have recorded on that system
+and what other artifacts from the image show.
+
+- Source letter = the drive in `SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRoot`
+  (e.g. `C:\Windows` → `C:\`). usnproc needs the SOFTWARE hive on the
+  volume, so the volume is always that system's Windows volume.
+- If SystemRoot is missing: paths start with `?:\`, plus a manifest warning
+  (`SOURCE_DRIVE_LETTER_UNKNOWN`). The mount letter is never used in events.
+- The manifest records both: `volume.drive_letter_at_processing` (mount
+  letter) and `volume.drive_letter_on_source_system`, with its basis.
+- The volume is also identified in every event by `VolumeSerial`.
 
 ## Implementation notes
 
@@ -403,6 +438,12 @@ re-litigation without a specific technical reason to revisit.
 
 ## Change log
 
+- **v1.2 (2026-11-25):** Q5: empty, disabled, missing and corrupt journals
+  each produce an `.evtx` holding one status record (EventID 919 / 916),
+  instead of header-only or no `.evtx`. Q11: the status record's TimeCreated
+  = the image's last ShutdownTime (1601-01-01 if absent). Added Q12: event
+  paths use the source system's drive letter (from SystemRoot), `?:` if
+  unknown, never the analysis mount letter.
 - **v1.1 (2026-11-24):** Q1 file names now include the processing time
   (`_{ProcessedUtc}`, compact UTC `YYYYMMDDTHHMMSSZ`) so repeat runs never
   overwrite. Added Q11: event records contain only USN journal and
