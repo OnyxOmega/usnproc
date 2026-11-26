@@ -11,6 +11,16 @@ mount supports the operations usnproc needs:
     5. Registry hives exist at Windows\\System32\\config\\{SOFTWARE, SYSTEM}
     6. python-registry can open the SOFTWARE hive (primary read path)
     7. MachineGuid extractable from Cryptography key
+    8. Running elevated (usnproc needs administrator rights)
+    9. SYSTEM hive opens and the hostname is readable (usnproc exit 6 otherwise)
+   10. SAM hive readable -> machine SID                   [warning only]
+   11. SystemRoot readable -> source drive letter (Q12)   [warning only]
+   12. ShutdownTime readable (status-record time, Q11)    [warning only]
+   13. $Extend\\$UsnJrnl visible through the mount (D4)   [warning only]
+
+Warning-only checks never fail verification: usnproc has a documented
+fallback for each (empty MachineSID, VolumeSerial path prefix, 1601-01-01
+status time, disabled/missing journals reported as missing).
 
 Exit codes:
     0 = all checks passed (mount compatible with usnproc)
@@ -33,6 +43,7 @@ License: PolyForm Noncommercial 1.0.0 -- YASDC, Inc.
 """
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import struct
@@ -192,6 +203,9 @@ def check_query_journal(drive_letter):
             0,
             None)
     except Exception as exc:
+        if (getattr(exc, "winerror", None) or 0) == 5:
+            return False, ("CreateFile(%s) failed: access denied (winerror 5) -- "
+                           "run from an elevated (Administrator) prompt" % vol), None
         return False, "CreateFile(%s) failed: %r" % (vol, exc), None
 
     try:
@@ -280,7 +294,7 @@ def check_read_journal(drive_letter, journal_info):
         if errno == 1180:
             # ERROR_JOURNAL_ENTRY_DELETED -- StartUsn precedes FirstUsn (which
             # shouldn't happen since we PASSED FirstUsn, but some mounts glitch
-            # here). Retry with LowestValidUsn.
+            # here). Reported as a failure; no retry is attempted.
             return False, ("FSCTL_READ_USN_JOURNAL failed at FirstUsn "
                            "(winerror 1180 -- journal entry deleted; ring "
                            "buffer boundary condition)"), 0
@@ -383,6 +397,138 @@ def check_machineguid(drive_letter):
 
 
 # =========================================================================== #
+# Checks 8-13: what usnproc needs beyond the original seven
+# =========================================================================== #
+_CONFIG = ("Windows", "System32", "config")
+
+
+def _hive_path(drive_letter, name):
+    return os.path.join(drive_letter, *(_CONFIG + (name,)))
+
+
+def _reg_value(reg, key_path, name):
+    """Value from a python-registry hive, or None if key/value missing."""
+    try:
+        key = reg.open(key_path)
+    except Exception:
+        return None
+    for v in key.values():
+        if v.name().lower() == name.lower():
+            return v.value()
+    return None
+
+
+def _control_set(reg):
+    cur = _reg_value(reg, "Select", "Current")
+    try:
+        return "ControlSet%03d" % int(cur)
+    except (TypeError, ValueError):
+        return "ControlSet001"
+
+
+def check_elevated():
+    """Check 8: usnproc opens the raw volume, which needs administrator
+    rights. Returns (ok, message)."""
+    try:
+        import ctypes
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return True, "running elevated (Administrator)"
+        return False, ("NOT elevated -- run usnproc (and this check) from an "
+                       "Administrator prompt")
+    except Exception as exc:
+        return False, "could not determine elevation: %r" % exc
+
+
+def check_system_hive(drive_letter):
+    """Check 9: SYSTEM hive opens via python-registry and ComputerName is
+    readable. Returns (ok, message, hostname)."""
+    try:
+        from Registry.Registry import Registry
+        reg = Registry(_hive_path(drive_letter, "SYSTEM"))
+    except Exception as exc:
+        return False, "python-registry could not open SYSTEM hive: %r" % exc, None
+    cs = _control_set(reg)
+    host = _reg_value(reg, cs + "\\Control\\ComputerName\\ComputerName", "ComputerName")
+    if not host:
+        return False, "ComputerName not found under %s" % cs, None
+    return True, "SYSTEM hive opened (%s)" % cs, str(host)
+
+
+def check_sam_sid(drive_letter):
+    """Check 10 (warning only): machine SID from SAM\\Domains\\Account V.
+    Returns (ok, message, sid)."""
+    try:
+        from Registry.Registry import Registry
+        reg = Registry(_hive_path(drive_letter, "SAM"))
+    except Exception as exc:
+        return False, ("SAM hive not readable (%r); usnproc will leave MachineSID "
+                       "empty" % exc), None
+    v = _reg_value(reg, "SAM\\Domains\\Account", "V")
+    if not v or len(v) < 24 or v[-24] != 1 or v[-23] != 4:
+        return False, "machine SID not found in SAM; MachineSID will be empty", None
+    tail = bytes(v[-24:])
+    subs = struct.unpack_from("<4I", tail, 8)
+    sid = "S-1-%d" % int.from_bytes(tail[2:8], "big") + "".join("-%d" % x for x in subs)
+    return True, "machine SID read from SAM", sid
+
+
+def check_system_root(drive_letter):
+    """Check 11 (warning only): SystemRoot gives the drive letter the source
+    system used (DESIGN_LOCK Q12). Returns (ok, message, letter)."""
+    try:
+        from Registry.Registry import Registry
+        reg = Registry(_hive_path(drive_letter, "SOFTWARE"))
+        root = _reg_value(reg, "Microsoft\\Windows NT\\CurrentVersion", "SystemRoot")
+    except Exception as exc:
+        root, err = None, exc
+    else:
+        err = None
+    m = re.match(r"\s*([A-Za-z]):", root or "")
+    if not m:
+        why = ("SystemRoot not found" if err is None
+               else "SOFTWARE hive not readable: %r" % err)
+        return False, ("%s; usnproc will use the VolumeSerial in place of the "
+                       "drive letter in paths" % why), None
+    return True, "SystemRoot = %s" % root, m.group(1).upper() + ":\\"
+
+
+def check_shutdown_time(drive_letter):
+    """Check 12 (warning only): ShutdownTime is the timestamp usnproc gives a
+    status record when the journal is unusable (DESIGN_LOCK Q11).
+    Returns (ok, message, iso_time)."""
+    try:
+        from Registry.Registry import Registry
+        reg = Registry(_hive_path(drive_letter, "SYSTEM"))
+        raw = _reg_value(reg, _control_set(reg) + "\\Control\\Windows", "ShutdownTime")
+    except Exception as exc:
+        return False, "SYSTEM hive not readable: %r" % exc, None
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) < 8 or not any(raw[:8]):
+        return False, ("ShutdownTime not found; a status record would be dated "
+                       "1601-01-01"), None
+    ft = struct.unpack_from("<Q", bytes(raw), 0)[0]
+    when = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ft // 10)
+    return True, "ShutdownTime read", when.strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def check_usnjrnl_visible(drive_letter):
+    """Check 13 (warning only): can $Extend\\$UsnJrnl be seen through the
+    mount? usnproc uses this to tell a DISABLED journal from a MISSING one
+    (plan D4). Access denied still proves the name exists. Returns
+    (ok, message)."""
+    path = os.path.join(drive_letter, "$Extend", "$UsnJrnl")
+    try:
+        os.stat(path)
+        return True, "$Extend\\$UsnJrnl visible"
+    except PermissionError:
+        return True, "$Extend\\$UsnJrnl present (access denied, name resolves)"
+    except OSError as exc:
+        if getattr(exc, "winerror", None) in (5, 32):
+            return True, "$Extend\\$UsnJrnl present (locked, name resolves)"
+        return False, ("$Extend\\$UsnJrnl not visible through this mount (%r); a "
+                       "disabled journal would be reported as missing" % exc)
+
+
+# =========================================================================== #
 # Main verification orchestrator
 # =========================================================================== #
 def run_verification(drive_letter):
@@ -408,7 +554,7 @@ def run_verification(drive_letter):
         # Everything else depends on the drive being present.
         print()
         _print_skip("Remaining checks skipped (drive not accessible)")
-        skipped = 6
+        skipped = 6 + N_EXTRA_CHECKS
         return passed, failed, skipped
 
     # Check 2
@@ -422,7 +568,7 @@ def run_verification(drive_letter):
         failed += 1
         print()
         _print_skip("Remaining checks skipped (not NTFS)")
-        skipped = 5
+        skipped = 5 + N_EXTRA_CHECKS
         return passed, failed, skipped
 
     # Check 3
@@ -477,7 +623,7 @@ def run_verification(drive_letter):
         failed += 1
         _print_skip("SOFTWARE hive open + MachineGuid extraction skipped "
                     "(hive file missing)")
-        skipped += 2
+        skipped += 2 + N_EXTRA_CHECKS
         return passed, failed, skipped
 
     # Check 6a: python-registry importable
@@ -490,7 +636,7 @@ def run_verification(drive_letter):
         _print_info(msg)
         failed += 1
         _print_skip("MachineGuid extraction skipped (python-registry missing)")
-        skipped += 1
+        skipped += 1 + N_EXTRA_CHECKS
         return passed, failed, skipped
 
     # Check 6b: python-registry can open SOFTWARE hive
@@ -503,7 +649,7 @@ def run_verification(drive_letter):
         _print_info(msg)
         failed += 1
         _print_skip("MachineGuid extraction skipped (hive open failed)")
-        skipped += 1
+        skipped += 1 + N_EXTRA_CHECKS
         return passed, failed, skipped
 
     # Check 7: MachineGuid
@@ -517,7 +663,56 @@ def run_verification(drive_letter):
         _print_info(msg)
         failed += 1
 
-    return passed, failed, skipped
+    p, f = run_extra_checks(drive_letter)
+    return passed + p, failed + f, skipped
+
+
+N_EXTRA_CHECKS = 6
+
+
+def run_extra_checks(drive_letter):
+    """Checks 8-13. Required checks (8, 9) count as pass/fail. Warning-only
+    checks (10-13) count as passed when OK; a [WARN] never fails
+    verification. Returns (passed, failed)."""
+    passed = failed = 0
+
+    ok, msg = check_elevated()
+    if ok:
+        _print_ok(msg)
+        passed += 1
+    else:
+        _print_fail("Not running elevated")
+        _print_info(msg)
+        failed += 1
+
+    ok, msg, host = check_system_hive(drive_letter)
+    if ok:
+        _print_ok(msg)
+        _print_info("Hostname: %s" % host)
+        passed += 1
+    else:
+        _print_fail("SYSTEM hive check failed")
+        _print_info(msg)
+        failed += 1
+
+    for label, fn in (("Machine SID", check_sam_sid),
+                      ("Source drive letter", check_system_root),
+                      ("ShutdownTime", check_shutdown_time)):
+        ok, msg, value = fn(drive_letter)
+        if ok:
+            _print_ok(msg)
+            _print_info("%s: %s" % (label, value))
+            passed += 1
+        else:
+            _print_warn(msg)
+
+    ok, msg = check_usnjrnl_visible(drive_letter)
+    if ok:
+        _print_ok(msg)
+        passed += 1
+    else:
+        _print_warn(msg)
+    return passed, failed
 
 
 # =========================================================================== #
@@ -558,6 +753,9 @@ def main():
     if failed == 0 and skipped == 0:
         print()
         print("VERIFICATION PASSED -- mount is compatible with usnproc.")
+        if passed < 8 + N_EXTRA_CHECKS:
+            print("(See [WARN] lines above: usnproc will run, using the "
+                  "documented fallbacks.)")
         sys.exit(0)
     else:
         print()

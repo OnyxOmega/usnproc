@@ -386,10 +386,215 @@ class OrchestratorTests(unittest.TestCase):
             '', 0, 255, 0, 'FAT32')
         with patch('sys.stdout', new_callable=io.StringIO) as buf:
             passed, failed, skipped = uv.run_verification('F:\\')
-        # Drive-present passes, ntfs fails, rest skipped
+        # Drive-present passes, ntfs fails, rest skipped (5 original + 6 new)
         self.assertEqual(passed, 1)
         self.assertEqual(failed, 1)
-        self.assertEqual(skipped, 5)
+        self.assertEqual(skipped, 5 + uv.N_EXTRA_CHECKS)
+
+
+# --------------------------------------------------------------------------- #
+# Checks 8-13 (added for usnproc v0.0.1 / DESIGN_LOCK v1.3)
+# --------------------------------------------------------------------------- #
+import os  # noqa: E402
+import struct as _struct  # noqa: E402
+
+
+class _Val:
+    def __init__(self, name, value):
+        self._n, self._v = name, value
+
+    def name(self):
+        return self._n
+
+    def value(self):
+        return self._v
+
+
+class _Key:
+    def __init__(self, values):
+        self._values = values
+
+    def values(self):
+        return [_Val(n, v) for n, v in self._values.items()]
+
+    def value(self, name):
+        if name not in self._values:
+            raise KeyError(name)
+        return _Val(name, self._values[name])
+
+
+def fake_registry_module(hives):
+    """hives: {hive_file_name: {key_path: {value_name: value}}} -> a fake
+    Registry.Registry module whose Registry(path) serves those keys."""
+    class FakeRegistry:
+        def __init__(self, path):
+            name = os.path.basename(path.replace("\\", "/"))
+            if name not in hives:
+                raise IOError("cannot open %s" % path)
+            self._keys = hives[name]
+
+        def open(self, key_path):
+            if key_path not in self._keys:
+                raise KeyError(key_path)
+            return _Key(self._keys[key_path])
+
+    mod = MagicMock()
+    mod.Registry = FakeRegistry
+    pkg = MagicMock()
+    pkg.Registry = mod
+    return {"Registry": pkg, "Registry.Registry": mod}
+
+
+SID_V = b"\x00" * 40 + bytes([1, 4, 0, 0, 0, 0, 0, 5]) + _struct.pack("<4I", 21, 1, 2, 3)
+GOOD_HIVES = {
+    "SOFTWARE": {"Microsoft\\Windows NT\\CurrentVersion": {"SystemRoot": "C:\\WINDOWS"},
+                 "Microsoft\\Cryptography": {"MachineGuid": "g"}},
+    "SYSTEM": {"Select": {"Current": 1},
+               "ControlSet001\\Control\\ComputerName\\ComputerName":
+                   {"ComputerName": "SRCHOST"},
+               "ControlSet001\\Control\\Windows":
+                   {"ShutdownTime": _struct.pack("<Q", 133600000000000000)}},
+    "SAM": {"SAM\\Domains\\Account": {"V": SID_V}},
+}
+
+
+class ExtraCheckTests(unittest.TestCase):
+
+    def reg(self, hives=GOOD_HIVES):
+        return patch.dict(sys.modules, fake_registry_module(hives))
+
+    def test_system_hive_ok(self):
+        with self.reg():
+            ok, msg, host = uv.check_system_hive('F:\\')
+        self.assertTrue(ok)
+        self.assertEqual(host, 'SRCHOST')
+
+    def test_system_hive_missing_hostname(self):
+        h = dict(GOOD_HIVES, SYSTEM={"Select": {"Current": 2}})
+        with self.reg(h):
+            ok, msg, host = uv.check_system_hive('F:\\')
+        self.assertFalse(ok)
+        self.assertIn('ControlSet002', msg)
+
+    def test_system_hive_unopenable(self):
+        h = {k: v for k, v in GOOD_HIVES.items() if k != "SYSTEM"}
+        with self.reg(h):
+            ok, msg, _ = uv.check_system_hive('F:\\')
+        self.assertFalse(ok)
+
+    def test_sam_sid(self):
+        with self.reg():
+            ok, msg, sid = uv.check_sam_sid('F:\\')
+        self.assertTrue(ok)
+        self.assertEqual(sid, 'S-1-5-21-1-2-3')
+
+    def test_sam_missing_is_not_ok(self):
+        h = {k: v for k, v in GOOD_HIVES.items() if k != "SAM"}
+        with self.reg(h):
+            ok, msg, sid = uv.check_sam_sid('F:\\')
+        self.assertFalse(ok)
+        self.assertIn('MachineSID', msg)
+
+    def test_system_root(self):
+        with self.reg():
+            ok, msg, letter = uv.check_system_root('F:\\')
+        self.assertTrue(ok)
+        self.assertEqual(letter, 'C:\\')
+
+    def test_system_root_missing_mentions_fallback(self):
+        h = dict(GOOD_HIVES, SOFTWARE={"Microsoft\\Cryptography": {"MachineGuid": "g"}})
+        with self.reg(h):
+            ok, msg, letter = uv.check_system_root('F:\\')
+        self.assertFalse(ok)
+        self.assertIn('VolumeSerial', msg)
+
+    def test_shutdown_time(self):
+        with self.reg():
+            ok, msg, when = uv.check_shutdown_time('F:\\')
+        self.assertTrue(ok)
+        self.assertTrue(when.startswith('2024-05-12'))
+
+    def test_shutdown_time_missing(self):
+        h = dict(GOOD_HIVES, SYSTEM={"Select": {"Current": 1}})
+        with self.reg(h):
+            ok, msg, when = uv.check_shutdown_time('F:\\')
+        self.assertFalse(ok)
+        self.assertIn('1601-01-01', msg)
+
+    def test_usnjrnl_visible(self):
+        with patch('os.stat', return_value=None):
+            self.assertTrue(uv.check_usnjrnl_visible('F:\\')[0])
+        with patch('os.stat', side_effect=PermissionError()):
+            self.assertTrue(uv.check_usnjrnl_visible('F:\\')[0])
+        with patch('os.stat', side_effect=FileNotFoundError()):
+            ok, msg = uv.check_usnjrnl_visible('F:\\')
+        self.assertFalse(ok)
+        self.assertIn('missing', msg)
+
+    def test_elevated(self):
+        fake_ctypes = MagicMock()
+        fake_ctypes.windll.shell32.IsUserAnAdmin.return_value = 0
+        with patch.dict(sys.modules, {'ctypes': fake_ctypes}):
+            ok, msg = uv.check_elevated()
+        self.assertFalse(ok)
+        self.assertIn('Administrator', msg)
+        fake_ctypes.windll.shell32.IsUserAnAdmin.return_value = 1
+        with patch.dict(sys.modules, {'ctypes': fake_ctypes}):
+            self.assertTrue(uv.check_elevated()[0])
+
+    def test_createfile_access_denied_hint(self):
+        exc = Exception('denied')
+        exc.winerror = 5
+        fake_win32file.CreateFile.side_effect = exc
+        try:
+            ok, msg, _ = uv.check_query_journal('F:\\')
+        finally:
+            fake_win32file.CreateFile.side_effect = None
+        self.assertFalse(ok)
+        self.assertIn('elevated', msg)
+
+    def test_extra_checks_warnings_do_not_fail(self):
+        h = {"SOFTWARE": {}, "SYSTEM": GOOD_HIVES["SYSTEM"]}     # no SAM, no SystemRoot
+        fake_ctypes = MagicMock()
+        fake_ctypes.windll.shell32.IsUserAnAdmin.return_value = 1
+        with self.reg(h), patch.dict(sys.modules, {'ctypes': fake_ctypes}), \
+                patch('os.stat', return_value=None), \
+                patch('sys.stdout', new_callable=io.StringIO) as buf:
+            passed, failed = uv.run_extra_checks('F:\\')
+        self.assertEqual(failed, 0)
+        self.assertEqual(passed, 4)       # elevated, SYSTEM, ShutdownTime, $UsnJrnl
+        self.assertEqual(buf.getvalue().count('[WARN]'), 2)
+
+    def test_extra_checks_required_failures(self):
+        fake_ctypes = MagicMock()
+        fake_ctypes.windll.shell32.IsUserAnAdmin.return_value = 0
+        with self.reg({}), patch.dict(sys.modules, {'ctypes': fake_ctypes}), \
+                patch('os.stat', side_effect=FileNotFoundError()), \
+                patch('sys.stdout', new_callable=io.StringIO):
+            passed, failed = uv.run_extra_checks('F:\\')
+        self.assertEqual((passed, failed), (0, 2))
+
+    def test_full_run_all_fourteen_pass(self):
+        q = _struct.pack("<QqqqqQQ", 1, 100, 200, 0, 2**63 - 1, 33554432, 524288)
+        fake_win32file.GetDriveType.side_effect = None
+        fake_win32file.GetDriveType.return_value = 3
+        fake_win32file.CreateFile.side_effect = None
+        fake_win32file.CreateFile.return_value = 'h'
+        fake_win32file.DeviceIoControl.side_effect = [q, _struct.pack("<q", 1) + b"\x00" * 96]
+        fake_win32api.GetVolumeInformation.side_effect = None
+        fake_win32api.GetVolumeInformation.return_value = ('L', 1, 255, 0, 'NTFS')
+        c = MagicMock()
+        c.windll.shell32.IsUserAnAdmin.return_value = 1
+        try:
+            with self.reg(), patch.dict(sys.modules, {'ctypes': c}), \
+                    patch('os.path.exists', return_value=True), \
+                    patch('os.path.getsize', return_value=1), \
+                    patch('os.stat', return_value=None), \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                result = uv.run_verification('F:\\')
+        finally:
+            fake_win32file.DeviceIoControl.side_effect = None
+        self.assertEqual(result, (8 + uv.N_EXTRA_CHECKS, 0, 0))
 
 
 if __name__ == '__main__':

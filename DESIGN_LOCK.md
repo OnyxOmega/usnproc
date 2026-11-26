@@ -402,8 +402,9 @@ EvtxECmd map compatibility. Record offline origin in the manifest instead.
 ### Pre-code verification required
 
 - **FTK Imager IOCTL pass-through:** run `usnproc_verify.py` against a test
-  image mounted with FTK Imager File System / Read Only mode. Confirm all 7
-  checks pass before proceeding with implementation.
+  image mounted with FTK Imager File System / Read Only mode. Confirm the
+  required checks (1–9) pass. Since v1.3 the script runs 13 checks, and
+  checks 10–13 only warn.
 - **python-registry library API:** confirm current API hasn't drifted since
   initial research.
 
@@ -420,9 +421,11 @@ EvtxECmd map compatibility. Record offline origin in the manifest instead.
 
 ## Ready-to-use artifacts
 
-- **usnproc_verify.py** — mount compatibility check (7 tests, delivered
-  previously)
-- **test_usnproc_verify.py** — 41-test mock suite covering all branch logic
+- **usnproc_verify.py** — mount compatibility check (originally 7 checks;
+  13 since v1.3: elevation, SYSTEM hive, SAM SID, SystemRoot, ShutdownTime
+  and `$UsnJrnl` visibility added)
+- **test_usnproc_verify.py** — mock suite covering all branch logic (41
+  tests originally, 56 since v1.3)
 - This document — complete design lock
 
 ## Workflow
@@ -453,7 +456,8 @@ re-litigation without a specific technical reason to revisit.
 - **v1.3 (2026-11-25):** Q5: a read that stops partway appends one 916
   truncation record, timed at the last written USN record. Q12: when the
   source letter is unknown, paths use the VolumeSerial (`D66FD839:\`)
-  instead of `?:\`.
+  instead of `?:\`. usnproc_verify.py gained checks 8–13 for the data
+  usnproc now relies on.
 - **v1.2 (2026-11-25):** Q5: empty, disabled, missing and corrupt journals
   each produce an `.evtx` holding one status record (EventID 919 / 916),
   instead of header-only or no `.evtx`. Q11: the status record's TimeCreated
